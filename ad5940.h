@@ -16,6 +16,43 @@
 #include "math.h"
 #include "string.h"
 #include "stdio.h"
+
+/* ============================================================================
+ * Track B fork: AD5940_RAM_FN macro
+ *
+ * When AD5940_PIN_HOT_PATH_TO_RAM=1 is defined at compile time (via
+ * platformio.ini build_flags), tag selected hot-path functions with
+ * pico-sdk's __not_in_flash_func() so they live in SRAM instead of
+ * XIP flash. Lets Core1 keep executing AD5940 SDK calls while Core0
+ * is mid-flash-commit (no need for multicore_lockout to park Core1).
+ *
+ * Default (flag undefined): macro is a no-op; build matches vendor.
+ *
+ * Cost: each tagged function moves to .time_critical. SRAM section,
+ * adding to .bss/.data load image. Tagging ~40 hot-path functions
+ * costs ~30-50 KB SRAM (estimate; bench to confirm).
+ *
+ * Selection criteria (which functions get the tag):
+ *   - Anything Core1 may call during a single CA / SWV / CV firing.
+ *   - Includes transitive callees down to the SPI MCU port.
+ *   - Excludes config-only fns Core1 only touches at boot
+ *     (AD5940_Initialize, AD5940_MCUResourceInit, etc).
+ * ============================================================================ */
+#ifdef AD5940_PIN_HOT_PATH_TO_RAM
+  #include "pico.h"
+  #define AD5940_RAM_FN(name)  __not_in_flash_func(name)
+  /* AD5940_RAM_DATA: place a const table / static data declaration in
+   * SRAM instead of XIP .rodata. Insert between the type and the name
+   * in a declaration:
+   *   static const uint32_t AD5940_RAM_DATA("ad5940_tab") FooTab[] = {...};
+   * The group string keeps related tables in one section block for the
+   * linker; any value is fine but consistent grouping helps map files. */
+  #define AD5940_RAM_DATA(group) __not_in_flash(group)
+#else
+  #define AD5940_RAM_FN(name)    name
+  #define AD5940_RAM_DATA(group) /* nothing */
+#endif
+
 /** @addtogroup AD5940_Library
   * @{
   */

@@ -1,0 +1,8 @@
+{
+  "name": "ad5940lib",
+  "version": "0.2.1-fork.0",
+  "description": "AD5940 SDK fork — adds AD5940_RAM_FN(name) macro for SRAM-residency of Core1 hot path. Vendor at https://github.com/analogdevicesinc/ad5940lib (commit 818c548).",
+  "build": {
+    "libArchive": false
+  }
+}
