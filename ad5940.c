@@ -1056,20 +1056,54 @@ void AD5940_RAM_FN(AD5940_FIFORd)(uint32_t *pBuffer, uint32_t uiReadCount)
    }
    else
    {
-      AD5940_CsClr();
-      AD5940_ReadWrite8B(SPICMD_READFIFO);
-      /* 6 dummy write before valid data read back */
-      for(i=0;i<6;i++)
-         AD5940_ReadWrite8B(0);
-      /* Continuously read DATAFIFORD register with offset 0 */
-      for(i=0;i<uiReadCount-2;i++)
+      /* ---- memestat fork: COALESCED BURST ---------------------------------
+       * Upstream issued 1 + 6 + N separate AD5940_ReadWriteNBytes calls here.
+       * The bytes on the wire were already one CS frame, but every call is a
+       * full port-layer SPI transaction, and on a DMA/RTOS host that dominates:
+       * measured on nRF5340 + Zephyr at 1 MHz, a 200-word drain cost 18.0 ms,
+       * i.e. ~87 us per transaction against ~56 us of actual wire time.
+       *
+       * Same bytes, same order, same MOSI content -- three transactions:
+       *   1) command + 6 dummy
+       *   2) the (N-2) body words, MOSI = 0x00 (offset 0 = keep reading
+       *      DATAFIFORD). A NULL send buffer means "clock zeros" in both ports:
+       *      RP2350 memsets the rx buffer and transfers in place; the Zephyr
+       *      port passes no tx_bufs and the peripheral clocks its overrun
+       *      character, which its overlay pins to 0x00.
+       *   3) the last two words with MOSI = 0x44444444, exactly as upstream.
+       *
+       * NOTE the byte order. The AD5940 returns each word MSB-first and
+       * AD5940_ReadWrite32B reassembled it as rx[0]<<24|...|rx[3]. Reading
+       * straight into pBuffer on a little-endian host therefore needs a swap,
+       * which is what the final loop does. Getting this wrong yields plausible
+       * garbage rather than an error. */
       {
-         pBuffer[i] = AD5940_ReadWrite32B(0); /*Offset is 0, so we always read DATAFIFORD register */
+         uint8_t hdr[7];
+         uint8_t tail_tx[8], tail_rx[8];
+         uint32_t body_words = uiReadCount - 2u;
+
+         hdr[0] = SPICMD_READFIFO;
+         for(i=1;i<7;i++) hdr[i] = 0;
+
+         AD5940_CsClr();
+         AD5940_ReadWriteNBytes(hdr, 0, 7);
+         if(body_words)
+            AD5940_ReadWriteNBytes(0, (unsigned char *)pBuffer, body_words*4u);
+         for(i=0;i<8;i++) tail_tx[i] = 0x44;
+         AD5940_ReadWriteNBytes(tail_tx, tail_rx, 8);
+         AD5940_CsSet();
+
+         for(i=0;i<body_words;i++)
+         {
+            uint8_t *b = (uint8_t *)&pBuffer[i];
+            pBuffer[i] = ((uint32_t)b[0]<<24)|((uint32_t)b[1]<<16)|
+                         ((uint32_t)b[2]<<8) |((uint32_t)b[3]);
+         }
+         pBuffer[body_words]      = ((uint32_t)tail_rx[0]<<24)|((uint32_t)tail_rx[1]<<16)|
+                                    ((uint32_t)tail_rx[2]<<8) |((uint32_t)tail_rx[3]);
+         pBuffer[body_words + 1u] = ((uint32_t)tail_rx[4]<<24)|((uint32_t)tail_rx[5]<<16)|
+                                    ((uint32_t)tail_rx[6]<<8) |((uint32_t)tail_rx[7]);
       }
-      /* Read back last two FIFO data with none-zero offset*/
-      pBuffer[i++] = AD5940_ReadWrite32B(0x44444444);
-      pBuffer[i] = AD5940_ReadWrite32B(0x44444444);
-      AD5940_CsSet();
    }
 }
 
