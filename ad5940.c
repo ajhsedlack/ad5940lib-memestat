@@ -984,19 +984,33 @@ static uint32_t AD5940_RAM_FN(AD5940_ReadWrite32B)(uint32_t data)
  * @return Return None.
 **/
 static void AD5940_RAM_FN(AD5940_SPIWriteReg)(uint16_t RegAddr, uint32_t RegData)
-{  
-  /* Set register address */
+{
+  /* ---- memestat fork: COALESCED, 2 transactions instead of 4 --------------- */
+  uint8_t tx[5];
+  uint32_t wide = ((RegAddr >= 0x1000) && (RegAddr <= 0x3014)) ? 1u : 0u;
+
+  tx[0] = SPICMD_SETADDR;
+  tx[1] = (uint8_t)(RegAddr >> 8);
+  tx[2] = (uint8_t)(RegAddr & 0xff);
   AD5940_CsClr();
-  AD5940_ReadWrite8B(SPICMD_SETADDR);
-  AD5940_ReadWrite16B(RegAddr);
+  AD5940_ReadWriteNBytes(tx, 0, 3);
   AD5940_CsSet();
-  /* Add delay here to meet the SPI timing. */
-  AD5940_CsClr();
-  AD5940_ReadWrite8B(SPICMD_WRITEREG);
-  if(((RegAddr>=0x1000)&&(RegAddr<=0x3014)))
-    AD5940_ReadWrite32B(RegData);
+
+  /* Upstream carried a bare "/* Add delay here to meet the SPI timing. *\/"
+   * comment between the frames with no delay under it. The CS rising edge is
+   * the separation; that is unchanged here. */
+  tx[0] = SPICMD_WRITEREG;
+  if(wide)
+  {
+    tx[1] = (uint8_t)(RegData>>24); tx[2] = (uint8_t)(RegData>>16);
+    tx[3] = (uint8_t)(RegData>>8);  tx[4] = (uint8_t)(RegData);
+  }
   else
-    AD5940_ReadWrite16B(RegData);
+  {
+    tx[1] = (uint8_t)(RegData>>8);  tx[2] = (uint8_t)(RegData);
+  }
+  AD5940_CsClr();
+  AD5940_ReadWriteNBytes(tx, 0, wide ? 5u : 3u);
   AD5940_CsSet();
 }
 
@@ -1006,24 +1020,37 @@ static void AD5940_RAM_FN(AD5940_SPIWriteReg)(uint16_t RegAddr, uint32_t RegData
  * @return Return register data.
 **/
 static uint32_t AD5940_RAM_FN(AD5940_SPIReadReg)(uint16_t RegAddr)
-{  
-  uint32_t Data = 0;
-  /* Set register address that we want to read */
+{
+  /* ---- memestat fork: COALESCED, 2 transactions instead of 5 ---------------
+   * Upstream issued SETADDR / addr / READREG / dummy / data as five separate
+   * AD5940_ReadWriteNBytes calls. Identical bytes and identical CS framing --
+   * still two CS frames -- but each call is a full port-layer SPI transaction,
+   * and that is what costs. Measured on nRF5340 + Zephyr at 8 MHz: 157.8 us for
+   * a read whose wire time is ~7 us. This is the hot path: AD5940_FIFOGetCnt()
+   * is a 32-bit register read polled on every WUPT tick. */
+  uint8_t tx[6], rx[6];
+  uint32_t wide = ((RegAddr >= 0x1000) && (RegAddr <= 0x3014)) ? 1u : 0u;
+  uint32_t n = wide ? 6u : 4u;
+
+  /* Frame 1: set the address we want to read. */
+  tx[0] = SPICMD_SETADDR;
+  tx[1] = (uint8_t)(RegAddr >> 8);
+  tx[2] = (uint8_t)(RegAddr & 0xff);
   AD5940_CsClr();
-  AD5940_ReadWrite8B(SPICMD_SETADDR);
-  AD5940_ReadWrite16B(RegAddr);
+  AD5940_ReadWriteNBytes(tx, rx, 3);
   AD5940_CsSet();
-  /* Read it */
+
+  /* Frame 2: command + host-status dummy, then the data clocks back MSB-first
+   * at rx[2..]. MOSI is 0 for the data phase, as upstream sent. */
+  tx[0] = SPICMD_READREG;
+  tx[1] = 0; tx[2] = 0; tx[3] = 0; tx[4] = 0; tx[5] = 0;
   AD5940_CsClr();
-  AD5940_ReadWrite8B(SPICMD_READREG);
-  AD5940_ReadWrite8B(0);  //Dummy read
-  /* The real data is coming */
-  if((RegAddr>=0x1000)&&(RegAddr<=0x3014))
-    Data = AD5940_ReadWrite32B(0);
-  else
-    Data = AD5940_ReadWrite16B(0);
+  AD5940_ReadWriteNBytes(tx, rx, n);
   AD5940_CsSet();
-  return Data;
+
+  if(wide)
+    return ((uint32_t)rx[2]<<24)|((uint32_t)rx[3]<<16)|((uint32_t)rx[4]<<8)|rx[5];
+  return ((uint32_t)rx[2]<<8)|rx[3];
 }
 
 /**
